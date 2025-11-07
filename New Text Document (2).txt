@@ -1,0 +1,150 @@
+import time
+import serial
+import pynmea2
+import RPi.GPIO as GPIO
+import board
+import busio
+import adafruit_ads1x15.ads1x15 as ADS
+from adafruit_ads1x15.ads1115 import ADS1115
+from adafruit_ads1x15.analog_in import AnalogIn
+from RPLCD.i2c import CharLCD
+
+# --- CONFIGURATION ---
+ALCOHOL_THRESHOLD = 23500   # Adjust based on your sensor calibration
+TEST_WINDOW = 5             # Duration of test in seconds
+PHONE_NUMBER = "+91xxxxxxxxxx"
+
+# Define Relay States (Active LOW assumed)
+RELAY_LOCKED = GPIO.HIGH
+RELAY_OPENED = GPIO.LOW
+
+# --- PINS & PORTS ---
+RELAY_PIN = 23
+LED_PIN = 24
+GPS_PORT = "/dev/ttyAMA3"   # UART3 (GPIO 4/5)
+GSM_PORT = "/dev/serial0"   # Standard UART (GPIO 14/15)
+
+# --- HARDWARE SETUP ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.setup(LED_PIN, GPIO.OUT)
+
+# Initial State: LOCKED
+GPIO.output(RELAY_PIN, RELAY_LOCKED)
+GPIO.output(LED_PIN, GPIO.LOW)
+
+# I2C Setup
+i2c = busio.I2C(board.SCL, board.SDA)
+try:
+    lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8)
+    lcd.clear()
+except:
+    lcd = None
+
+try:
+    ads = ADS1115(i2c)
+    mq3 = AnalogIn(ads, ADS.P0)
+except:
+    mq3 = None
+    print("ADC Error")
+
+# Serial Setup
+try:
+    gps_serial = serial.Serial(GPS_PORT, baudrate=9600, timeout=0.5)
+    gsm_serial = serial.Serial(GSM_PORT, baudrate=9600, timeout=1)
+except:
+    print("Serial Error")
+
+# --- GLOBAL VARIABLES ---
+current_lat = "Unknown"
+current_lon = "Unknown"
+
+# --- HELPER FUNCTIONS ---
+def update_gps():
+    global current_lat, current_lon
+    if gps_serial.in_waiting > 0:
+        try:
+            line = gps_serial.readline().decode('utf-8', errors='replace').strip()
+            if line.startswith('$GPGGA'):
+                msg = pynmea2.parse(line)
+                if msg.gps_qual > 0:
+                    current_lat = str(round(msg.latitude, 5))
+                    current_lon = str(round(msg.longitude, 5))
+        except:
+            pass
+
+def send_sms_alert(alcohol_val):
+    if lcd:
+        lcd.clear()
+        lcd.write_string("Sending SMS...")
+    print("⚠ SENDING SMS ALERT...")
+
+    try:
+        gsm_serial.write(b'AT+CMGF=1\r\n')
+        time.sleep(1)
+        gsm_serial.write(f'AT+CMGS="{PHONE_NUMBER}"\r\n'.encode())
+        time.sleep(1)
+        msg = f"VIOLATION! Locked. Level: {alcohol_val}. Loc: http://maps.google.com/?q={current_lat},{current_lon}"
+        gsm_serial.write(msg.encode())
+        gsm_serial.write(bytes([26])) # Ctrl+Z
+        time.sleep(3)
+        print("SMS Sent.")
+    except Exception as e:
+        print(f"SMS Failed: {e}")
+
+# --- MAIN TEST ROUTINE ---
+def start_breath_test():
+    if lcd:
+        lcd.clear()
+        lcd.write_string("Wait for GPS...")
+    print("Waiting for GPS fix...")
+
+    timeout = time.time() + 5 # Wait max 5s for initial GPS attempt
+    while current_lat == "Unknown" and time.time() < timeout:
+        update_gps()
+
+    if lcd:
+        lcd.clear()
+        lcd.write_string("BLOW NOW! (5s)")
+    print("\n--- STARTING 5s BREATH TEST ---")
+
+    start_time = time.time()
+    while (time.time() - start_time) < TEST_WINDOW:
+        remaining = int(TEST_WINDOW - (time.time() - start_time)) + 1
+        if lcd:
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string(f"Time left: {remaining}s ")
+
+        update_gps()
+        if mq3:
+            alcohol_level = mq3.value
+            print(f"Level: {alcohol_level} | Time: {remaining}s")
+
+            if alcohol_level > ALCOHOL_THRESHOLD:
+                print("\n❌ FAILED!")
+                GPIO.output(RELAY_PIN, RELAY_LOCKED)
+                GPIO.output(LED_PIN, GPIO.HIGH)
+                if lcd:
+                    lcd.clear()
+                    lcd.write_string("TEST FAILED!")
+                send_sms_alert(alcohol_level)
+                while True: # Lock forever
+                    update_gps()
+                    time.sleep(1)
+        time.sleep(0.2)
+
+    print("\n✅ PASSED")
+    GPIO.output(RELAY_PIN, RELAY_OPENED)
+    GPIO.output(LED_PIN, GPIO.LOW)
+    if lcd:
+        lcd.clear()
+        lcd.write_string("PASSED - DRIVE")
+
+# --- RUN ---
+try:
+    start_breath_test()
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    GPIO.cleanup()
