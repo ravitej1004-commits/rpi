@@ -1,159 +1,234 @@
 import time
-import serial
-import pynmea2
-import RPi.GPIO as GPIO
 import board
 import busio
-from adafruit_ads1x15.ads1115 import ADS1115
+import math
+import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
 from RPLCD.i2c import CharLCD
+import serial
+import pynmea2
+import digitalio
 
 # --- CONFIGURATION ---
-ALCOHOL_THRESHOLD = 23500   # UPDATE THIS with your calibration value
-TEST_WINDOW = 5             # Duration of test in seconds
-PHONE_NUMBER = "+91xxxxxxxxxx"
+LCD_COLUMNS = 16
+LCD_ROWS = 2
+ADC_CHANNEL_NUMBER = ADS.P1 # Use P0 for A0, P1 for A1
+VCC_VOLTAGE = 5.0
+LOAD_RESISTOR_RL = 5000.0
 
-# --- PINS & PORTS ---
-RELAY_PIN = 23
-LED_PIN = 24
-GPS_PORT = "/dev/ttyAMA3"
-GSM_PORT = "/dev/serial0"
+# GSM on serial0 (GPIO14/15)
+GSM_SERIAL_PORT = "/dev/serial0"
+PHONE_NUMBER_TO_ALERT = "‪+918828954768‬" # Check if this number format is correct for AT commands
 
-# --- HARDWARE SETUP ---
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.setup(LED_PIN, GPIO.OUT)
+# GPS on UART3 (GPIO4 = TX3, GPIO5 = RX3)
+GPS_SERIAL_PORT = "/dev/ttyAMA3" # Corrected port from our previous troubleshooting
+GPS_BAUDRATE = 9600
 
-# Initial State: LOCKED
-GPIO.output(RELAY_PIN, GPIO.HIGH) # Relay OFF (Locked)
-GPIO.output(LED_PIN, GPIO.LOW)
+# Relay and LED pins
+RELAY_PIN = board.D17 # GPIO 17
+LED_PIN = board.D21   # GPIO 21
 
-# I2C Devices
-i2c = busio.I2C(board.SCL, board.SDA)
-try:
-    lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8)
-    lcd.clear()
-except:
-    lcd = None
+# Calibration values
+CLEAN_AIR_RO = 27000.0
+ALCOHOL_LOG_A = -0.602
+ALCOHOL_LOG_B = -0.301
+MG_L_TO_PPM_FACTOR = 531.0
+LEGAL_LIMIT_PPM = 126.0 # Set your legal limit
 
-try:
-    # Manually define P0 to avoid library attribute errors
-    P0 = 0
-    ads = ADS1115(i2c)
-    mq3 = AnalogIn(ads, P0)
-except:
-    mq3 = None
-    print("ADC/Sensor Error - Check Wiring")
+# --- FUNCTIONS ---
 
-# Serial Ports
-try:
-    gps_serial = serial.Serial(GPS_PORT, baudrate=9600, timeout=0.1)
-    gsm_serial = serial.Serial(GSM_PORT, baudrate=9600, timeout=1)
-except:
-    print("Serial Port Error")
+def calculate_resistance(voltage):
+    if voltage <= 0:
+        voltage = 0.000001 # Prevent divide-by-zero
+    rs = ((VCC_VOLTAGE * LOAD_RESISTOR_RL) / voltage) - LOAD_RESISTOR_RL
+    return rs if rs > 0 else 0
 
-# --- GLOBAL VARIABLES ---
-current_lat = "Unknown"
-current_lon = "Unknown"
+def calculate_mg_l(rs_ro_ratio):
+    if rs_ro_ratio <= 0:
+        return 0
+    log_rs_ro = math.log10(rs_ro_ratio)
+    log_concentration = (log_rs_ro - ALCOHOL_LOG_B) / ALCOHOL_LOG_A
+    return pow(10, log_concentration)
 
-# --- HELPER FUNCTIONS ---
-def update_gps():
-    global current_lat, current_lon
-    # Non-blocking check for new GPS data
-    while gps_serial.in_waiting > 0:
-        try:
-            line = gps_serial.readline().decode('utf-8', errors='replace').strip()
-            if line.startswith('$GPGGA'):
-                msg = pynmea2.parse(line)
-                if msg.gps_qual > 0:
-                    current_lat = str(round(msg.latitude, 5))
-                    current_lon = str(round(msg.longitude, 5))
-        except:
-            pass
-
-def send_sms_alert(alcohol_val):
-    if lcd:
+def send_sms_warning(lcd, ser, phone_number, message):
+    try:
         lcd.clear()
         lcd.write_string("Sending SMS...")
-    print("⚠ SENDING SMS ALERT...")
-
-    try:
-        gsm_serial.write(b'AT+CMGF=1\r\n')
-        time.sleep(0.5)
-        gsm_serial.write(f'AT+CMGS="{PHONE_NUMBER}"\r\n'.encode())
-        time.sleep(0.5)
-        
-        # Handle cases where GPS hasn't locked yet
-        if current_lat == "Unknown":
-            loc_msg = "Loc: Unknown (No GPS Fix)"
-        else:
-            loc_msg = f"Loc: http://maps.google.com/?q={current_lat},{current_lon}"
-            
-        msg = f"VIOLATION! Vehicle Locked. Alcohol Level: {alcohol_val}. {loc_msg}"
-        gsm_serial.write(msg.encode())
-        gsm_serial.write(bytes([26])) # Ctrl+Z to send
-        time.sleep(2)
-        print("SMS Sent.")
     except Exception as e:
-        print(f"SMS Failed: {e}")
-
-# --- MAIN ROUTINE ---
-def start_system():
-    print("\n--- SYSTEM STARTING IMMEDIATE TEST ---")
-    if lcd:
-        lcd.clear()
-        lcd.write_string("BLOW NOW! (5s)")
-    
-    start_time = time.time()
-    
-    # 5-Second Test Loop
-    while (time.time() - start_time) < TEST_WINDOW:
-        remaining = int(TEST_WINDOW - (time.time() - start_time)) + 1
+        print(f"LCD Error (SMS Send): {e}")
         
-        # Constantly try to get GPS in the background
-        update_gps()
-        
-        if mq3:
-            val = mq3.value
-            print(f"Testing: {val} | Time: {remaining}s | GPS: {current_lat}")
-            
-            # FAIL CONDITION
-            if val > ALCOHOL_THRESHOLD:
-                print("\n❌ FAILED! LOCKING SYSTEM.")
-                GPIO.output(RELAY_PIN, GPIO.HIGH) # Ensure locked
-                GPIO.output(LED_PIN, GPIO.HIGH)   # LED ON
-                if lcd:
-                    lcd.clear()
-                    lcd.write_string("TEST FAILED!")
-                
-                send_sms_alert(val)
-                
-                # Lock forever until reboot
-                while True:
-                    update_gps() # Keep trying to get better GPS coords
-                    time.sleep(1)
-
-        if lcd:
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string(f"Time: {remaining}s ")
-        time.sleep(0.2)
-
-    # PASS CONDITION
-    print("\n✅ PASSED. Engine Unlocked.")
-    GPIO.output(RELAY_PIN, GPIO.LOW) # Relay ON (Unlock engine)
-    GPIO.output(LED_PIN, GPIO.LOW)
-    if lcd:
-        lcd.clear()
-        lcd.write_string("PASSED - DRIVE")
-
-# --- RUN ---
-try:
-    start_system()
-    # Keep main thread alive to maintain relay state
-    while True:
-        update_gps()
+    try:
+        print(f"\nSending SMS: {message}")
+        ser.write(b'AT+CMGF=1\r\n')
         time.sleep(1)
+        ser.write(f'AT+CMGS="{phone_number}"\r\n'.encode())
+        time.sleep(1)
+        ser.write(f'{message}\r\n'.encode())
+        ser.write(bytes([26])) # Ctrl+Z
+        time.sleep(3)
+        lcd.clear()
+        lcd.write_string("SMS Sent OK")
+    except Exception as e:
+        lcd.clear()
+        lcd.write_string("SMS Failed")
+        print(f"SMS Error: {e}")
+    time.sleep(2)
+
+def get_gps_location(gps_ser):
+    try:
+        # Read a larger chunk to ensure we get a full line
+        data = gps_ser.read(512).decode('ascii', errors='ignore')
+        for line in data.splitlines():
+            if "$GPGGA" in line:
+                msg = pynmea2.parse(line)
+                if msg.latitude and msg.longitude:
+                    return f"{msg.latitude:.5f},{msg.longitude:.5f}"
+    except Exception as e:
+        print(f"GPS Parse Error: {e}")
+    return "No Fix"
+
+# --- MAIN PROGRAM ---
+
+# Define all device variables as None before try block
+i2c = None
+ads = None
+chan = None
+lcd = None
+ser_gsm = None
+ser_gps = None
+relay = None
+led = None
+
+try:
+    # --- Initialize Hardware ---
+    i2c = busio.I2C(board.SCL, board.SDA)
+    ads = ADS.ADS1115(i2c)
+    # Use the pin constant from config
+    chan = AnalogIn(ads, ADC_CHANNEL_NUMBER) 
+
+    lcd = CharLCD(i2c_expander='PCF8574',
+                  address=0x27,
+                  port=1,
+                  cols=LCD_COLUMNS,
+                  rows=LCD_ROWS,
+                  backlight_enabled=True)
+    
+    ser_gsm = serial.Serial(GSM_SERIAL_PORT, 9600, timeout=1)
+    ser_gps = serial.Serial(GPS_SERIAL_PORT, GPS_BAUDRATE, timeout=0.1)
+
+    relay = digitalio.DigitalInOut(RELAY_PIN)
+    relay.direction = digitalio.Direction.OUTPUT
+    led = digitalio.DigitalInOut(LED_PIN)
+    led.direction = digitalio.Direction.OUTPUT
+
+    BASELINE_MG_L = calculate_mg_l(1.0)
+    
+    lcd.clear()
+    lcd.write_string("System Ready")
+    time.sleep(2)
+    lcd.clear()
+
+    print("Starting Alcohol + GPS + GSM system...")
+    print(f"Calibrated RO: {CLEAN_AIR_RO} Ohms")
+    print(f"PPM Limit: {LEGAL_LIMIT_PPM} PPM")
+    
+    while True:
+        
+        # --- 1. TEST WINDOW (5 Seconds) ---
+        print("\nState: TESTING. 5-second window is open.")
+        lcd.clear()
+        
+        start_time = time.time()
+        max_ppm = 0.0
+
+        while time.time() - start_time < 5.0:
+            time_left = 5.0 - (time.time() - start_time)
+            
+            voltage = chan.voltage
+            rs = calculate_resistance(voltage)
+            ratio = rs / CLEAN_AIR_RO
+            
+            mg_l = calculate_mg_l(ratio)
+            cal_mg_l = mg_l - BASELINE_MG_L
+            if cal_mg_l < 0: cal_mg_l = 0
+            
+            current_ppm = cal_mg_l * MG_L_TO_PPM_FACTOR
+            
+            if current_ppm > max_ppm:
+                max_ppm = current_ppm
+            
+            lcd.cursor_pos = (0, 0)
+            lcd.write_string(f"BLOW NOW {time_left: <4.1f}s")
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string(f"Reading: {max_ppm:<8.1f}")
+            
+            print(f"Testing... Max PPM so far: {max_ppm:.1f}", end="\r")
+            time.sleep(0.1)
+
+        # --- 2. PROCESS RESULTS ---
+        print(f"\nState: ANALYZING. Max PPM: {max_ppm:.2f}")
+        lcd.clear()
+        lcd.write_string("Analyzing...")
+        lcd.crlf()
+        lcd.write_string(f"Result:{max_ppm:.2f}PPM")
+        time.sleep(2.0)
+
+        is_warning = max_ppm > LEGAL_LIMIT_PPM
+
+        if is_warning:
+            # --- FAIL (Over Limit) ---
+            print("Result: FAIL. Over limit.")
+            lcd.clear()
+            lcd.write_string("TEST FAILED")
+            lcd.crlf()
+            lcd.write_string(f"{max_ppm:.2f} PPM")
+            
+            relay.value = False # Relay OFF (Locked)
+            led.value = True    # Red LED ON
+            
+            gps_data = get_gps_location(ser_gps)
+            msg = f"ALCOHOL ALERT: {max_ppm:.1f}ppm at {gps_data}"
+            send_sms_warning(lcd, ser_gsm, PHONE_NUMBER_TO_ALERT, msg)
+            
+            lcd.clear()
+            lcd.write_string("DEVICE LOCKED")
+            
+        else:
+            # --- PASS (Under Limit) ---
+            print("Result: PASS. Under limit.")
+            lcd.clear()
+            lcd.write_string("TEST PASSED")
+            
+            relay.value = True # Relay ON (Unlocked)
+            led.value = False    # LED Off
+            lcd.crlf()
+            lcd.write_string("Circuit Open")
+            
+        # --- 3. RESET ---
+        print("Resetting in 10 seconds...")
+        lcd.crlf()
+        lcd.write_string("Reset in 10s...")
+        time.sleep(10.0)
+
 except KeyboardInterrupt:
-    GPIO.cleanup()
-    print("\nSystem Shutdown")
+    print("\nProgram stopped by user.")
+except Exception as e:
+    print(f"\nAn fatal error occurred: {e}")
+finally:
+    # --- Safe cleanup block ---
+    print("\nCleaning up hardware...")
+    if lcd:
+        lcd.clear()
+        lcd.write_string("System OFF")
+        lcd.backlight_enabled = False
+    if relay:
+        relay.value = False # Default to locked state
+    if led:
+        led.value = False
+    if ser_gsm and ser_gsm.is_open:
+        ser_gsm.close()
+        print("GSM port closed.")
+    if ser_gps and ser_gps.is_open:
+        ser_gps.close()
+        print("GPS port closed.")
+    print("Cleanup complete. Goodbye.")
