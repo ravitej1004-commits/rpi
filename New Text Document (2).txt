@@ -9,155 +9,71 @@ from adafruit_ads1x15.analog_in import AnalogIn
 from RPLCD.i2c import CharLCD
 
 # --- CONFIGURATION ---
-ALCOHOL_THRESHOLD = 23500   # UPDATE THIS with your calibration value
-TEST_WINDOW = 5             # Duration of test in seconds
-PHONE_NUMBER = "+919825947498" # Your number
+ALCOHOL_THRESHOLD = 23500
+TEST_WINDOW = 5
+P0 = 0
 
-# --- PINS & PORTS ---
+# --- PINS ---
 RELAY_PIN = 23
 LED_PIN = 24
 GPS_PORT = "/dev/ttyAMA3"
 GSM_PORT = "/dev/serial0"
-P0 = 0 # Define Pin A0 for ADC
 
-# --- HARDWARE SETUP ---
+# --- SETUP ---
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 GPIO.setup(RELAY_PIN, GPIO.OUT)
 GPIO.setup(LED_PIN, GPIO.OUT)
-GPIO.output(RELAY_PIN, GPIO.HIGH) # Relay OFF (Locked)
+GPIO.output(RELAY_PIN, GPIO.HIGH)
 GPIO.output(LED_PIN, GPIO.LOW)
 
-# I2C Devices
 i2c = busio.I2C(board.SCL, board.SDA)
-lcd = None
-mq3 = None
+lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8)
+ads = ADS1115(i2c)
+mq3 = AnalogIn(ads, P0)
 
-try:
-    lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8)
-    lcd.clear()
-    print("LCD Connected.")
-except Exception as e:
-    print(f"LCD Error on init: {e}. Running without LCD.")
-
-try:
-    ads = ADS1115(i2c)
-    mq3 = AnalogIn(ads, P0)
-    print("ADC/MQ-3 Connected.")
-except Exception as e:
-    print(f"ADC Error on init: {e}. Check wiring.")
-
-# Serial Ports
 try:
     gps_serial = serial.Serial(GPS_PORT, baudrate=9600, timeout=0.1)
     gsm_serial = serial.Serial(GSM_PORT, baudrate=9600, timeout=1)
-    print("Serial Ports Opened.")
-except Exception as e:
-    print(f"Serial Port Error: {e}")
+except:
+    print("SERIAL ERROR - Continuing anyway for debug")
 
-# --- GLOBAL VARIABLES ---
-current_lat = "Unknown"
-current_lon = "Unknown"
-last_lcd_error = 0
+print("\n--- STARTING DEBUG LOOP ---")
+lcd.clear()
+lcd.write_string("DEBUG MODE")
 
-# --- HELPER FUNCTIONS ---
-def safe_lcd_write(line1, line2=""):
-    global lcd, last_lcd_error
-    if lcd:
-        try:
-            lcd.cursor_pos = (0, 0)
-            lcd.write_string(line1.ljust(16))
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string(line2.ljust(16))
-        except OSError as e:
-            # Prevent spamming errors if LCD is disconnected
-            if time.time() - last_lcd_error > 5:
-                print(f"LCD Write Error: {e}. Check I2C connection.")
-                last_lcd_error = time.time()
-                
-def update_gps():
-    global current_lat, current_lon
-    try:
-        while gps_serial.in_waiting > 0:
-            line = gps_serial.readline().decode('utf-8', errors='replace').strip()
-            if line.startswith('$GPGGA'):
-                msg = pynmea2.parse(line)
-                if msg.gps_qual > 0:
-                    current_lat = str(round(msg.latitude, 5))
-                    current_lon = str(round(msg.longitude, 5))
-    except Exception as e:
-        print(f"GPS read error: {e}")
-
-def send_sms_alert(alcohol_val):
-    safe_lcd_write("Sending SMS...")
-    print("⚠ SENDING SMS ALERT...")
-    try:
-        gsm_serial.write(b'AT+CMGF=1\r\n')
-        time.sleep(0.5)
-        gsm_serial.write(f'AT+CMGS="{PHONE_NUMBER}"\r\n'.encode())
-        time.sleep(0.5)
-        
-        loc_msg = f"Loc: {current_lat},{current_lon}" if current_lat != "Unknown" else "Loc: Unknown"
-        msg = f"VIOLATION! Vehicle Locked. Alcohol: {alcohol_val}. {loc_msg}"
-        
-        gsm_serial.write(msg.encode())
-        gsm_serial.write(bytes([26])) # Ctrl+Z
-        time.sleep(2)
-        print("SMS Sent.")
-    except Exception as e:
-        print(f"SMS Failed: {e}")
-
-# --- MAIN ROUTINE ---
-def start_system():
-    if not mq3:
-        print("MQ-3 Sensor not found. Cannot start test.")
-        safe_lcd_write("SENSOR ERROR", "Check Wiring")
-        while True: time.sleep(1) # Halt
-
-    print("\n--- SYSTEM STARTING IMMEDIATE TEST ---")
-    safe_lcd_write("BLOW NOW!", "(5s Test)")
+start_time = time.time()
+while (time.time() - start_time) < TEST_WINDOW:
+    remaining = int(TEST_WINDOW - (time.time() - start_time)) + 1
     
-    start_time = time.time()
-    
-    while (time.time() - start_time) < TEST_WINDOW:
-        remaining = int(TEST_WINDOW - (time.time() - start_time)) + 1
-        
-        update_gps()
-        
+    print("1. Checking GPS...")
+    # INLINE GPS CHECK FOR DEBUGGING
+    if gps_serial.in_waiting > 0:
+         try:
+             line = gps_serial.readline().decode('utf-8', errors='replace')
+             print(f"   -> GPS Data found: {line.strip()[:10]}...")
+         except: pass
+    else:
+        print("   -> No GPS data waiting")
+
+    print("2. Reading MQ-3 Sensor...")
+    try:
         val = mq3.value
-        print(f"Testing: {val} | Time: {remaining}s | GPS: {current_lat}", end="\r")
-        
-        # FAIL CONDITION
-        if val > ALCOHOL_THRESHOLD:
-            print("\n❌ FAILED! LOCKING SYSTEM.")
-            GPIO.output(RELAY_PIN, GPIO.HIGH) # Locked
-            GPIO.output(LED_PIN, GPIO.HIGH)   # LED ON
-            safe_lcd_write("TEST FAILED!", f"Level: {val}")
-            
-            send_sms_alert(val)
-            
-            # Lock forever until reboot
-            while True:
-                update_gps()
-                time.sleep(1)
+        print(f"   -> Sensor Value: {val}")
+    except Exception as e:
+        print(f"   -> SENSOR READ FAILED: {e}")
+        val = 0
 
-        # This call is now safe and won't hang
-        safe_lcd_write("BLOW NOW!", f"Time: {remaining}s")
-        time.sleep(0.2)
+    print("3. Updating LCD...")
+    try:
+        lcd.cursor_pos = (1,0)
+        lcd.write_string(f"Time: {remaining}sVal:{val}".ljust(16))
+        print("   -> LCD Updated")
+    except Exception as e:
+         print(f"   -> LCD FAILED: {e}")
 
-    # PASS CONDITION
-    print("\n✅ PASSED. Engine Unlocked.")
-    GPIO.output(RELAY_PIN, GPIO.LOW) # Relay ON (Unlock engine)
-    GPIO.output(LED_PIN, GPIO.LOW)
-    safe_lcd_write("PASSED", "Drive Safely")
+    print("--------------------------------")
+    time.sleep(0.5)
 
-# --- RUN ---
-try:
-    start_system()
-    while True:
-        update_gps()
-        time.sleep(1)
-except KeyboardInterrupt:
-    GPIO.cleanup()
-    if lcd: lcd.clear()
-    print("\nSystem Shutdown")
+print("DEBUG LOOP FINISHED")
+GPIO.cleanup()
