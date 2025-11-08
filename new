@@ -1,98 +1,70 @@
 import time
 import math
+import RPi.GPIO as GPIO
 import board
 import busio
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
 from RPLCD.i2c import CharLCD
-import RPi.GPIO as GPIO
 
-# -----------------------------
-# GPIO Configuration
-# -----------------------------
-RELAY_PIN = 23         # BCM pin connected to relay
-RELAY_ACTIVE_LOW = True # True if relay is active on LOW signal
-
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(RELAY_PIN, GPIO.OUT)
-
-if RELAY_ACTIVE_LOW:
-    RELAY_ON = GPIO.LOW
-    RELAY_OFF = GPIO.HIGH
-else:
-    RELAY_ON = GPIO.HIGH
-    RELAY_OFF = GPIO.LOW
-
-GPIO.output(RELAY_PIN, RELAY_OFF)  # Keep relay OFF initially
-
-# -----------------------------
-# LCD Initialization
-# -----------------------------
-lcd = CharLCD('PCF8574', 0x27)
-lcd.clear()
-lcd.write_string("MQ3 Alcohol Test")
-time.sleep(2)
-lcd.clear()
-
-# -----------------------------
-# ADS1115 & MQ3 Setup
-# -----------------------------
+# ---------------------------
+# MQ3 & ADS1115 Setup
+# ---------------------------
 i2c = busio.I2C(board.SCL, board.SDA)
 ads = ADS.ADS1115(i2c)
 chan = AnalogIn(ads, ADS.P0)
 
-# Calibration baseline (Ro)
-print("--- MQ3 Alcohol Detection ---")
-lcd.write_string("Calibrating MQ3...")
-Ro = 21680.9  # You can adjust this from your earlier calibration
-time.sleep(2)
+Ro = 21680.9  # Sensor calibration resistance
+THRESHOLD_PPM = 200  # Alcohol threshold in PPM
+
+# ---------------------------
+# Relay Setup (Active-LOW)
+# ---------------------------
+RELAY_PIN = 23
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.output(RELAY_PIN, GPIO.HIGH)  # Relay OFF initially
+
+# ---------------------------
+# LCD Setup
+# ---------------------------
+lcd = CharLCD('PCF8574', 0x27)
 lcd.clear()
+lcd.write_string("MQ3 Alcohol Test")
 
-ALCOHOL_THRESHOLD = 150  # PPM threshold for relay trigger
-
-def read_mq3():
-    voltage = chan.voltage
-    Rs = (5.0 - voltage) * 10000 / voltage  # assuming 10k load resistor
-    ratio = Rs / Ro
-    # Approximation formula for PPM (adjust for your sensor)
-    ppm = math.pow(10, (0.3934 * math.log10(ratio) + 1.5))
-    return voltage, ratio, ppm
-
-# -----------------------------
-# Main Loop
-# -----------------------------
-print("System Ready. Monitoring alcohol levels...")
-lcd.write_string("Monitoring...")
+print("System ready...\nPress Ctrl+C to stop.\n")
 
 try:
     while True:
-        voltage, ratio, ppm = read_mq3()
-        print(f"Voltage: {voltage:.3f} V | Rs/Ro: {ratio:.3f} | Alcohol: {ppm:.2f} PPM")
+        voltage = chan.voltage
+        Rs = (5.0 - voltage) * Ro / voltage
+        ratio = Rs / Ro
+        alcohol_ppm = 1000 * math.pow(ratio, -1.5)  # rough estimation
 
-        lcd.home()
-        lcd.write_string(f"Alcohol:{ppm:>6.1f}PPM")
-        lcd.crlf()
+        lcd.clear()
+        lcd.write_string(f"Alcohol: {alcohol_ppm:.1f} PPM")
 
-        if ppm > ALCOHOL_THRESHOLD:
-            lcd.write_string("Status: OVER LIMIT")
-            GPIO.output(RELAY_PIN, RELAY_ON)
+        print(f"Voltage: {voltage:.3f}V | Rs/Ro: {ratio:.3f} | Alcohol: {alcohol_ppm:.1f} PPM")
+
+        if alcohol_ppm >= THRESHOLD_PPM:
+            print("!! ALCOHOL DETECTED !! Relay ON")
+            GPIO.output(RELAY_PIN, GPIO.LOW)  # Turn relay ON
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string("RELAY: ON")
         else:
-            lcd.write_string("Status: SAFE      ")
-            GPIO.output(RELAY_PIN, RELAY_OFF)
+            print("No alcohol detected. Relay OFF")
+            GPIO.output(RELAY_PIN, GPIO.HIGH)  # Turn relay OFF
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string("RELAY: OFF")
 
-        time.sleep(1)
+        time.sleep(2)
 
 except KeyboardInterrupt:
-    print("\n[System] Test stopped manually.")
-
+    print("\nExiting safely...")
 finally:
-    # Turn off relay safely
-    print("[System] Turning relay OFF and releasing GPIO.")
-    GPIO.output(RELAY_PIN, RELAY_OFF)
-    time.sleep(1)
-    GPIO.cleanup(RELAY_PIN)
+    GPIO.output(RELAY_PIN, GPIO.HIGH)  # Make sure relay turns OFF
+    GPIO.cleanup()
     lcd.clear()
-    lcd.write_string("System Released")
-    time.sleep(2)
-    lcd.clear()
-    print("[System] GPIO released successfully. Relay OFF.")
+    lcd.write_string("System stopped.")
+    print("GPIO released and relay OFF.")
