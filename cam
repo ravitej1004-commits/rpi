@@ -4,15 +4,19 @@ import pynmea2
 import RPi.GPIO as GPIO
 import sys
 from RPLCD.i2c import CharLCD
-import cv2  # New import for Camera and Face Detection
+import cv2
 import os
+import mediapipe as mp # New MediaPipe import
+
+# Initialize MediaPipe solutions
+mp_face_detection = mp.solutions.face_detection
+mp_drawing = mp.solutions.drawing_utils
 
 # --- CONFIGURATION ---
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 TARGET_PHONE_NUMBER = "+919876543210" # 🚨 MANDATORY: UPDATE THIS NUMBER!
 IMAGE_SAVE_PATH = "/home/pi/interlock_proofs/" # Directory to save evidence images
-CASCADE_PATH = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
-# Note: Adjust CASCADE_PATH based on your OpenCV installation location.
+# CASCADE_PATH is no longer needed as we use MediaPipe
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
 MQ3_D0_ALARM_THRESHOLD = GPIO.LOW    # MQ-3 D0 pin usually goes LOW when alarm triggers
@@ -49,7 +53,7 @@ lcd = None
 gps_serial = None
 gsm_serial = None
 camera = None
-face_cascade = None
+face_detector = None # Changed from face_cascade
 last_detected_frame = None  # To store the last frame where a face was seen
 
 current_lat = "No GPS Fix"
@@ -71,7 +75,7 @@ try:
 except serial.SerialException:
     print("[CRITICAL ERROR] Serial Port Initialization Failed.")
 
-# 3. Initialize Camera and Cascade
+# 3. Initialize Camera and MediaPipe Detector
 try:
     if not os.path.exists(IMAGE_SAVE_PATH):
         os.makedirs(IMAGE_SAVE_PATH)
@@ -81,14 +85,17 @@ try:
     if not camera.isOpened():
         raise IOError("Cannot open webcam")
     
-    face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-    if face_cascade.empty():
-        raise IOError("Failed to load Haar Cascade XML file.")
+    # Initialize MediaPipe Face Detection model
+    face_detector = mp_face_detection.FaceDetection(
+        model_selection=0, # 0 for short-range (up to 2 meters)
+        min_detection_confidence=0.7 # High confidence for security
+    )
     
-    print("[System] Camera & Face Detector Initialized.")
+    print("[System] Camera & Face Detector Initialized (MediaPipe).")
 except Exception as e:
     camera = None
-    print(f"[ERROR] Camera/OpenCV Setup Failed: {e}. Running without camera.")
+    face_detector = None
+    print(f"[ERROR] Camera/MediaPipe Setup Failed: {e}. Running without camera.")
 
 
 # --- HELPER FUNCTIONS ---
@@ -123,7 +130,6 @@ def update_gps():
 
 def send_sms_alert():
     """Sends SMS alert with location using robust timing."""
-    # ... (SMS logic remains the same) ...
     if not gsm_serial or not gsm_serial.is_open:
         safe_lcd_write("SMS FAILED", "GSM Error")
         return
@@ -131,7 +137,6 @@ def send_sms_alert():
     safe_lcd_write("ALARM! Sending SMS", f"Loc: {current_lat}")
     print("\n\n⚠ SENDING SMS ALERT...")
     
-    # SMS logic implementation... (omitted for brevity)
     try:
         gsm_serial.write(b'AT+CMGF=1\r\n')
         time.sleep(0.5)
@@ -173,23 +178,32 @@ def start_system():
         mq3_state = GPIO.input(MQ3_PIN)
         update_gps()
 
-        # CAMERA AND FACE DETECTION LOGIC
+        # CAMERA AND FACE DETECTION LOGIC (MediaPipe)
         is_face_detected = False
-        if camera and camera.isOpened():
+        if camera and camera.isOpened() and face_detector:
             ret, frame = camera.read()
             if ret:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                # Detect faces
-                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                # 1. Convert BGR image to RGB (MediaPipe requirement)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                if len(faces) > 0:
+                # 2. Process the frame with MediaPipe Face Detection
+                results = face_detector.process(frame_rgb)
+                
+                # Create a local copy for drawing annotations
+                annotated_frame = frame.copy() 
+
+                if results.detections:
                     is_face_detected = True
-                    # Store the frame where the face was detected
-                    last_detected_frame = frame 
                     
-                    # Draw rectangles around faces for the proof image (if needed later)
-                    for (x, y, w, h) in faces:
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    # 3. Draw bounding boxes returned by MediaPipe
+                    for detection in results.detections:
+                        mp_drawing.draw_detection(annotated_frame, detection)
+                    
+                    # Store the annotated frame for proof
+                    last_detected_frame = annotated_frame 
+                else:
+                    # Store the clean frame if no face is detected
+                    last_detected_frame = frame
                     
             print(f"Time: {remaining}s | D0: {'ALARM' if mq3_state == MQ3_D0_ALARM_THRESHOLD else 'Clear'} | GPS: {current_lat} | Face: {is_face_detected}", end="\r")
         else:
@@ -205,8 +219,7 @@ def start_system():
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 filename = os.path.join(IMAGE_SAVE_PATH, f"ALARM_PROOF_{timestamp}.jpg")
                 
-                # Draw red box on the last frame confirming the failure event
-                # We reuse the last_detected_frame, which may or may not have a face box, but we add a FAIL text.
+                # Draw red failure text onto the stored frame
                 cv2.putText(last_detected_frame, "ALCOHOL FAIL", (10, 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
                 
@@ -219,7 +232,6 @@ def start_system():
 
             
             # 🚨 REINFORCED SAFETY ENFORCEMENT 🚨
-            # Force Relay to LOCKED (HIGH)
             GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE) 
             GPIO.output(LED_PIN, GPIO.HIGH)   # LED ON
             time.sleep(0.05) 
@@ -230,7 +242,6 @@ def start_system():
             
             # CRITICAL: Enter permanent lock loop
             while True:
-                # Keep the relay locked and GPS updated
                 GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE)
                 update_gps()
                 time.sleep(1)
