@@ -1,78 +1,132 @@
-import time
-import math
 import RPi.GPIO as GPIO
-import board
-import busio
-import adafruit_ads1x15.ads1115 as ADS
-from adafruit_ads1x15.analog_in import AnalogIn
+import time
+import serial
 from RPLCD.i2c import CharLCD
 
 # ---------------------------
-# MQ3 & ADS1115 Setup
+# Pin Configuration
 # ---------------------------
-i2c = busio.I2C(board.SCL, board.SDA)
-ads = ADS.ADS1115(i2c)
-chan = AnalogIn(ads, ADS.P0)
+MQ3_PIN = 24        # MQ3 digital output (D0)
+RELAY_PIN = 23      # Relay (Active-LOW)
+GSM_PORT = "/dev/ttyUSB0"   # GSM module serial port
+GPS_PORT = "/dev/ttyAMA3"   # GPS module serial port
+BAUD_RATE = 9600
 
-Ro = 21680.9  # Calibration resistance
-THRESHOLD_PPM = 200  # Alcohol threshold
-
 # ---------------------------
-# Relay Setup (Active-LOW)
+# GPIO Setup
 # ---------------------------
-RELAY_PIN = 23
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
+GPIO.setup(MQ3_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.output(RELAY_PIN, GPIO.HIGH)  # Start OFF
+GPIO.output(RELAY_PIN, GPIO.LOW)  # Relay ON initially
 
 # ---------------------------
 # LCD Setup
 # ---------------------------
 lcd = CharLCD('PCF8574', 0x27)
 lcd.clear()
-lcd.write_string("Alcohol Test Ready")
+lcd.write_string("System Initializing")
+time.sleep(1)
+lcd.clear()
+lcd.write_string("MQ3 Alcohol Test")
 
-print("System ready... Press Ctrl+C to stop.\n")
+# ---------------------------
+# Serial Setup (GSM + GPS)
+# ---------------------------
+try:
+    gsm = serial.Serial(GSM_PORT, BAUD_RATE, timeout=1)
+except Exception as e:
+    print(f"GSM Error: {e}")
+    gsm = None
 
 try:
+    gps = serial.Serial(GPS_PORT, BAUD_RATE, timeout=1)
+except Exception as e:
+    print(f"GPS Error: {e}")
+    gps = None
+
+print("System ready. Monitoring MQ3...\n")
+
+# ---------------------------
+# Function to Read GPS Location
+# ---------------------------
+def get_gps_location():
+    if not gps:
+        return "Unknown"
+
+    for _ in range(20):  # Read a few lines for valid data
+        line = gps.readline().decode(errors='ignore')
+        if line.startswith("$GPGGA") or line.startswith("$GPRMC"):
+            data = line.split(',')
+            if len(data) > 5 and data[3] and data[5]:
+                lat = float(data[3][:2]) + float(data[3][2:]) / 60
+                lon = float(data[5][:3]) + float(data[5][3:]) / 60
+                if data[4] == 'S': lat = -lat
+                if data[6] == 'W': lon = -lon
+                return f"Lat:{lat:.5f}, Lon:{lon:.5f}"
+    return "No Fix"
+
+# ---------------------------
+# Function to Send SMS
+# ---------------------------
+def send_sms(message):
+    if not gsm:
+        print("⚠️ GSM not connected, SMS skipped.")
+        return
+
+    gsm.write(b'AT+CMGF=1\r')         # Text mode
+    time.sleep(0.5)
+    gsm.write(b'AT+CMGS="+91XXXXXXXXXX"\r')  # <-- Replace with your phone number
+    time.sleep(0.5)
+    gsm.write(message.encode() + b"\r")
+    gsm.write(bytes([26]))  # CTRL+Z to send
+    time.sleep(2)
+    print("📱 SMS Sent!")
+
+# ---------------------------
+# Main Loop
+# ---------------------------
+try:
     while True:
-        voltage = chan.voltage
-        if voltage <= 0:
-            print("⚠️ MQ3 not connected properly")
-            time.sleep(1)
-            continue
+        mq3_state = GPIO.input(MQ3_PIN)
 
-        Rs = (5.0 - voltage) * Ro / voltage
-        ratio = Rs / Ro
-        alcohol_ppm = 1000 * math.pow(ratio, -1.5)
-
-        lcd.clear()
-        lcd.write_string(f"Alcohol: {alcohol_ppm:.1f} PPM")
-        print(f"Voltage={voltage:.3f}V | Alcohol={alcohol_ppm:.1f} PPM")
-
-        if alcohol_ppm >= THRESHOLD_PPM:
-            print("🚨 Alcohol detected -> Relay ON")
-            GPIO.output(RELAY_PIN, GPIO.LOW)
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string("Relay: ON ")
-        else:
-            print("✅ Clear -> Relay OFF (cleanup)")
-            # Force relay off by cleaning up pin
-            GPIO.cleanup(RELAY_PIN)
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(RELAY_PIN, GPIO.OUT)
-            GPIO.output(RELAY_PIN, GPIO.HIGH)
+        if mq3_state == GPIO.LOW:  # Alcohol detected
+            print("🚨 ALCOHOL DETECTED! Relay OFF & SMS sending.")
+            lcd.clear()
+            lcd.write_string("ALCOHOL DETECTED!")
             lcd.cursor_pos = (1, 0)
             lcd.write_string("Relay: OFF")
 
-        time.sleep(2)
+            GPIO.output(RELAY_PIN, GPIO.HIGH)  # Turn relay OFF
+
+            # Get GPS data
+            location = get_gps_location()
+            print("📡 Location:", location)
+
+            # Send alert SMS
+            message = f"ALERT! Alcohol detected.\nLocation: {location}"
+            send_sms(message)
+
+            # Cleanup and lock relay OFF
+            GPIO.cleanup()
+            print("GPIO cleaned, relay locked OFF.")
+            break
+
+        else:
+            print("No alcohol detected. Relay ON")
+            lcd.clear()
+            lcd.write_string("No Alcohol")
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string("Relay: ON")
+            GPIO.output(RELAY_PIN, GPIO.LOW)  # Keep relay ON
+
+        time.sleep(1)
 
 except KeyboardInterrupt:
-    print("\n[System] Manual stop.")
-
-finally:
-    print("[System] Cleaning up GPIO and turning relay OFF.")
-    GPIO.cleanup()
+    print("\nManual stop. Cleaning up...")
     lcd.clear()
     lcd.write_string("System stopped.")
+    GPIO.output(RELAY_PIN, GPIO.HIGH)
+    GPIO.cleanup()
+    print("GPIO cleaned up and relay OFF.")
