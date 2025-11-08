@@ -1,132 +1,269 @@
-import RPi.GPIO as GPIO
 import time
 import serial
+import pynmea2
+import RPi.GPIO as GPIO
+import sys
 from RPLCD.i2c import CharLCD
+import cv2  # New import for Camera and Face Detection
+import os
 
-# ---------------------------
-# Pin Configuration
-# ---------------------------
-MQ3_PIN = 24        # MQ3 digital output (D0)
-RELAY_PIN = 23      # Relay (Active-LOW)
-GSM_PORT = "/dev/ttyUSB0"   # GSM module serial port
-GPS_PORT = "/dev/ttyAMA3"   # GPS module serial port
+# --- CONFIGURATION ---
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+TARGET_PHONE_NUMBER = "+919876543210" # 🚨 MANDATORY: UPDATE THIS NUMBER!
+IMAGE_SAVE_PATH = "/home/pi/interlock_proofs/" # Directory to save evidence images
+CASCADE_PATH = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+# Note: Adjust CASCADE_PATH based on your OpenCV installation location.
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+MQ3_D0_ALARM_THRESHOLD = GPIO.LOW    # MQ-3 D0 pin usually goes LOW when alarm triggers
+TEST_WINDOW = 5                      # Duration of initial alcohol test in seconds
+
+# --- PINS & PORTS ---
+MQ3_PIN = 24                         # MQ3 digital output (D0)
+RELAY_PIN = 23                       # Controls vehicle interlock
+LED_PIN = 18                         # Status LED
+
+GSM_PORT = "/dev/ttyUSB0"            # GSM module serial port
+GPS_PORT = "/dev/ttyAMA3"            # GPS module serial port
 BAUD_RATE = 9600
 
-# ---------------------------
-# GPIO Setup
-# ---------------------------
+# --- RELAY LOGIC DEFINITION (HIGH = Lock, LOW = Unlock) ---
+RELAY_LOCKED_STATE = GPIO.HIGH
+RELAY_UNLOCKED_STATE = GPIO.LOW
+
+# --- SETUP ---
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
-GPIO.setup(MQ3_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# Outputs: Relay and LED
 GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.output(RELAY_PIN, GPIO.LOW)  # Relay ON initially
+GPIO.setup(LED_PIN, GPIO.OUT)
+GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE)    
+GPIO.output(LED_PIN, GPIO.LOW)       # LED OFF
 
-# ---------------------------
-# LCD Setup
-# ---------------------------
-lcd = CharLCD('PCF8574', 0x27)
-lcd.clear()
-lcd.write_string("System Initializing")
-time.sleep(1)
-lcd.clear()
-lcd.write_string("MQ3 Alcohol Test")
+# Input: MQ-3 Digital Output
+GPIO.setup(MQ3_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) 
 
-# ---------------------------
-# Serial Setup (GSM + GPS)
-# ---------------------------
+# Hardware and Global Variables
+lcd = None
+gps_serial = None
+gsm_serial = None
+camera = None
+face_cascade = None
+last_detected_frame = None  # To store the last frame where a face was seen
+
+current_lat = "No GPS Fix"
+current_lon = ""
+
+# 1. Initialize LCD
 try:
-    gsm = serial.Serial(GSM_PORT, BAUD_RATE, timeout=1)
-except Exception as e:
-    print(f"GSM Error: {e}")
-    gsm = None
+    lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8)
+    lcd.clear()
+    print("[System] LCD Connected.")
+except Exception:
+    print("[ERROR] LCD Error.")
 
+# 2. Initialize Serial Ports
 try:
-    gps = serial.Serial(GPS_PORT, BAUD_RATE, timeout=1)
+    gps_serial = serial.Serial(GPS_PORT, BAUD_RATE, timeout=0.1)
+    gsm_serial = serial.Serial(GSM_PORT, BAUD_RATE, timeout=1)
+    print("[System] Serial Ports Opened.")
+except serial.SerialException:
+    print("[CRITICAL ERROR] Serial Port Initialization Failed.")
+
+# 3. Initialize Camera and Cascade
+try:
+    if not os.path.exists(IMAGE_SAVE_PATH):
+        os.makedirs(IMAGE_SAVE_PATH)
+        print(f"[System] Created proof directory: {IMAGE_SAVE_PATH}")
+        
+    camera = cv2.VideoCapture(0)  # 0 is usually the default camera index
+    if not camera.isOpened():
+        raise IOError("Cannot open webcam")
+    
+    face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+    if face_cascade.empty():
+        raise IOError("Failed to load Haar Cascade XML file.")
+    
+    print("[System] Camera & Face Detector Initialized.")
 except Exception as e:
-    print(f"GPS Error: {e}")
-    gps = None
+    camera = None
+    print(f"[ERROR] Camera/OpenCV Setup Failed: {e}. Running without camera.")
 
-print("System ready. Monitoring MQ3...\n")
 
-# ---------------------------
-# Function to Read GPS Location
-# ---------------------------
-def get_gps_location():
-    if not gps:
-        return "Unknown"
+# --- HELPER FUNCTIONS ---
 
-    for _ in range(20):  # Read a few lines for valid data
-        line = gps.readline().decode(errors='ignore')
-        if line.startswith("$GPGGA") or line.startswith("$GPRMC"):
-            data = line.split(',')
-            if len(data) > 5 and data[3] and data[5]:
-                lat = float(data[3][:2]) + float(data[3][2:]) / 60
-                lon = float(data[5][:3]) + float(data[5][3:]) / 60
-                if data[4] == 'S': lat = -lat
-                if data[6] == 'W': lon = -lon
-                return f"Lat:{lat:.5f}, Lon:{lon:.5f}"
-    return "No Fix"
+def safe_lcd_write(line1, line2=""):
+    """Writes to LCD safely, ignoring errors."""
+    if lcd:
+        try:
+            lcd.clear()
+            lcd.write_string(line1.ljust(16))
+            lcd.cursor_pos = (1, 0)
+            lcd.write_string(line2.ljust(16))
+        except Exception:
+            pass
 
-# ---------------------------
-# Function to Send SMS
-# ---------------------------
-def send_sms(message):
-    if not gsm:
-        print("⚠️ GSM not connected, SMS skipped.")
+def update_gps():
+    """Reads GPS data non-blockingly using pynmea2."""
+    global current_lat, current_lon
+    if not gps_serial or not gps_serial.is_open:
         return
 
-    gsm.write(b'AT+CMGF=1\r')         # Text mode
-    time.sleep(0.5)
-    gsm.write(b'AT+CMGS="+91XXXXXXXXXX"\r')  # <-- Replace with your phone number
-    time.sleep(0.5)
-    gsm.write(message.encode() + b"\r")
-    gsm.write(bytes([26]))  # CTRL+Z to send
-    time.sleep(2)
-    print("📱 SMS Sent!")
+    while gps_serial.in_waiting > 0:
+        try:
+            line = gps_serial.readline().decode('utf-8', errors='replace').strip()
+            if line.startswith('$GPGGA'):
+                msg = pynmea2.parse(line)
+                if msg.gps_qual > 0:
+                    current_lat = str(round(msg.latitude, 5))
+                    current_lon = str(round(msg.longitude, 5))
+        except Exception: 
+            pass
 
-# ---------------------------
-# Main Loop
-# ---------------------------
-try:
-    while True:
-        mq3_state = GPIO.input(MQ3_PIN)
+def send_sms_alert():
+    """Sends SMS alert with location using robust timing."""
+    # ... (SMS logic remains the same) ...
+    if not gsm_serial or not gsm_serial.is_open:
+        safe_lcd_write("SMS FAILED", "GSM Error")
+        return
 
-        if mq3_state == GPIO.LOW:  # Alcohol detected
-            print("🚨 ALCOHOL DETECTED! Relay OFF & SMS sending.")
-            lcd.clear()
-            lcd.write_string("ALCOHOL DETECTED!")
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string("Relay: OFF")
-
-            GPIO.output(RELAY_PIN, GPIO.HIGH)  # Turn relay OFF
-
-            # Get GPS data
-            location = get_gps_location()
-            print("📡 Location:", location)
-
-            # Send alert SMS
-            message = f"ALERT! Alcohol detected.\nLocation: {location}"
-            send_sms(message)
-
-            # Cleanup and lock relay OFF
-            GPIO.cleanup()
-            print("GPIO cleaned, relay locked OFF.")
-            break
-
+    safe_lcd_write("ALARM! Sending SMS", f"Loc: {current_lat}")
+    print("\n\n⚠ SENDING SMS ALERT...")
+    
+    # SMS logic implementation... (omitted for brevity)
+    try:
+        gsm_serial.write(b'AT+CMGF=1\r\n')
+        time.sleep(0.5)
+        gsm_serial.read_all()
+        gsm_serial.write(f'AT+CMGS="{TARGET_PHONE_NUMBER}"\r\n'.encode('utf-8'))
+        time.sleep(0.5) 
+        
+        if current_lat == "No GPS Fix":
+            loc_msg = "Location: No GPS Fix."
         else:
-            print("No alcohol detected. Relay ON")
-            lcd.clear()
-            lcd.write_string("No Alcohol")
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string("Relay: ON")
-            GPIO.output(RELAY_PIN, GPIO.LOW)  # Keep relay ON
+            loc_msg = f"Location: https://maps.google.com/?q={current_lat},{current_lon}"
+            
+        message = f"VEHICLE INTERLOCK FAILURE! Alcohol Detected.\n{loc_msg}"
+        gsm_serial.write(message.encode('utf-8'))
+        time.sleep(0.5) 
+        gsm_serial.write(bytes([26])) 
+        time.sleep(5.0) 
+        response = gsm_serial.read_all().decode('utf-8', errors='ignore').strip()
+        if "OK" in response or "+CMGS" in response:
+            print("✅ SMS Sent OK.")
+        else:
+            print(f"❌ SMS Failed. Response: {response}")
+            
+    except Exception as e:
+        print(f"[ERROR] SMS Function Error: {e}")
 
-        time.sleep(1)
+# --- MAIN ROUTINE ---
+def start_system():
+    global last_detected_frame
+    print("\n--- VEHICLE INTERLOCK SYSTEM ACTIVE ---")
+    safe_lcd_write("INTERLOCK LOCKED", f"Blow Now! ({TEST_WINDOW}s)")
 
-except KeyboardInterrupt:
-    print("\nManual stop. Cleaning up...")
-    lcd.clear()
-    lcd.write_string("System stopped.")
-    GPIO.output(RELAY_PIN, GPIO.HIGH)
-    GPIO.cleanup()
-    print("GPIO cleaned up and relay OFF.")
+    start_time = time.time()
+    
+    # Test Loop: User must blow for the full duration
+    while (time.time() - start_time) < TEST_WINDOW:
+        remaining = int(TEST_WINDOW - (time.time() - start_time)) + 1
+        
+        mq3_state = GPIO.input(MQ3_PIN)
+        update_gps()
+
+        # CAMERA AND FACE DETECTION LOGIC
+        is_face_detected = False
+        if camera and camera.isOpened():
+            ret, frame = camera.read()
+            if ret:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # Detect faces
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                
+                if len(faces) > 0:
+                    is_face_detected = True
+                    # Store the frame where the face was detected
+                    last_detected_frame = frame 
+                    
+                    # Draw rectangles around faces for the proof image (if needed later)
+                    for (x, y, w, h) in faces:
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    
+            print(f"Time: {remaining}s | D0: {'ALARM' if mq3_state == MQ3_D0_ALARM_THRESHOLD else 'Clear'} | GPS: {current_lat} | Face: {is_face_detected}", end="\r")
+        else:
+            print(f"Time: {remaining}s | D0: {'ALARM' if mq3_state == MQ3_D0_ALARM_THRESHOLD else 'Clear'} | GPS: {current_lat}", end="\r")
+
+        
+        # FAIL CONDITION: Alcohol Detected at any point during the window
+        if mq3_state == MQ3_D0_ALARM_THRESHOLD:
+            print("\n\n❌ TEST FAILED! ALCOHOL DETECTED.")
+            
+            # --- IMAGE CAPTURE ON FAILURE ---
+            if last_detected_frame is not None:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = os.path.join(IMAGE_SAVE_PATH, f"ALARM_PROOF_{timestamp}.jpg")
+                
+                # Draw red box on the last frame confirming the failure event
+                # We reuse the last_detected_frame, which may or may not have a face box, but we add a FAIL text.
+                cv2.putText(last_detected_frame, "ALCOHOL FAIL", (10, 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+                
+                cv2.imwrite(filename, last_detected_frame)
+                print(f"📷 Proof image saved to: {filename}")
+                safe_lcd_write("FAIL! Image Saved", "SYSTEM LOCKED")
+            else:
+                safe_lcd_write("TEST FAILED!", "SYSTEM LOCKED")
+                print("⚠️ No face frame captured, skipping image save.")
+
+            
+            # 🚨 REINFORCED SAFETY ENFORCEMENT 🚨
+            # Force Relay to LOCKED (HIGH)
+            GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE) 
+            GPIO.output(LED_PIN, GPIO.HIGH)   # LED ON
+            time.sleep(0.05) 
+            GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE) 
+            print("[CRITICAL] Forced relay pin HIGH/LOCKED.")
+            
+            send_sms_alert()
+            
+            # CRITICAL: Enter permanent lock loop
+            while True:
+                # Keep the relay locked and GPS updated
+                GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE)
+                update_gps()
+                time.sleep(1)
+
+        safe_lcd_write(f"BLOW NOW {remaining}s", f"D0 State: {'ALARM!' if mq3_state == MQ3_D0_ALARM_THRESHOLD else 'Clear'}")
+        time.sleep(0.1)
+
+    # PASS CONDITION: Test window completed without alarm
+    print("\n\n✅ TEST PASSED. ENGINE UNLOCKED.")
+    GPIO.output(RELAY_PIN, RELAY_UNLOCKED_STATE) # Unlock Relay (Relay LOW)
+    GPIO.output(LED_PIN, GPIO.LOW)   # LED OFF
+    safe_lcd_write("TEST PASSED", "DRIVE SAFELY")
+
+# --- RUN LOOP ---
+if __name__ == "__main__":
+    try:
+        start_system()
+        # Keep main thread alive to maintain the unlocked/locked state
+        while True:
+            update_gps()
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        print("\n[System] User Shutdown.")
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] Unhandled exception: {e}")
+    finally:
+        # Release Camera and other resources
+        if camera:
+            camera.release()
+            print("[System] Camera released.")
+
+        # CRITICAL SAFETY STEP: Always ensure the vehicle is LOCKED on exit
+        print("\n[System] Ensuring vehicle is LOCKED and cleaning up GPIO.")
+        GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE) # FORCE LOCK
+        GPIO.cleanup()
