@@ -23,12 +23,12 @@ MQ3_D0_PIN = 18                      # Digital input from MQ-3 D0 pin
 GPS_PORT = "/dev/ttyAMA3"            # UART3 (GPIO 4/5)
 GSM_PORT = "/dev/serial0"            # Standard UART (GPIO 14/15)
 
-# --- NEW RELAY LOGIC DEFINITION ---
-# The relay is now configured so:
-# GPIO.LOW  -> Relay OFF (LOCKED - Safe State)
-# GPIO.HIGH -> Relay ON  (UNLOCKED - Run State)
-RELAY_LOCKED_STATE = GPIO.LOW
-RELAY_UNLOCKED_STATE = GPIO.HIGH
+# --- REVERSED RELAY LOGIC DEFINITION ---
+# Reversing the previous condition:
+# GPIO.HIGH -> Relay OFF/LOCKED (Active-Low configuration, Safe State)
+# GPIO.LOW  -> Relay ON/UNLOCKED
+RELAY_LOCKED_STATE = GPIO.HIGH
+RELAY_UNLOCKED_STATE = GPIO.LOW
 
 # --- SETUP ---
 GPIO.setmode(GPIO.BCM)
@@ -38,7 +38,7 @@ GPIO.setwarnings(False)
 GPIO.setup(RELAY_PIN, GPIO.OUT)
 GPIO.setup(LED_PIN, GPIO.OUT)
 
-# Initial State: Vehicle is LOCKED (Relay OFF) until test is passed
+# Initial State: Vehicle is LOCKED (Relay HIGH) until test is passed
 GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE)    
 GPIO.output(LED_PIN, GPIO.LOW)       # LED OFF
 
@@ -46,7 +46,6 @@ GPIO.output(LED_PIN, GPIO.LOW)       # LED OFF
 GPIO.setup(MQ3_D0_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) 
 
 # Hardware Initialization (Remainder of initialization logic is omitted for brevity but remains the same)
-# ... [Original hardware initialization code for LCD, GPS, GSM] ...
 lcd = None
 gps_serial = None
 gsm_serial = None
@@ -63,7 +62,8 @@ except: pass
 # --- GLOBAL VARIABLES & HELPER FUNCTIONS ---
 current_lat = "No GPS Fix"
 current_lon = ""
-# ... [Original safe_lcd_write, update_gps, and send_sms_alert functions] ...
+# The helper functions (safe_lcd_write, update_gps, send_sms_alert) remain functionally identical,
+# but are included here for completeness.
 
 def safe_lcd_write(line1, line2=""):
     """Writes to LCD safely, ignoring errors."""
@@ -138,11 +138,11 @@ def start_system():
         
         print(f"Time: {remaining}s | D0: {'ALARM' if mq3_d0_state == MQ3_D0_ALARM_THRESHOLD else 'Clear'} | GPS: {current_lat}", end="\r")
         
-        # FAIL CONDITION: Alcohol Detected (Relay stays OFF/LOW)
+        # FAIL CONDITION: Alcohol Detected (Relay stays LOCKED/HIGH)
         if mq3_d0_state == MQ3_D0_ALARM_THRESHOLD:
             print("\n\n❌ TEST FAILED! ALCOHOL DETECTED.")
             
-            # Lock Vehicle (Relay stays OFF)
+            # Lock Vehicle (Relay stays HIGH)
             GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE) 
             GPIO.output(LED_PIN, GPIO.HIGH)   # LED ON
             
@@ -158,9 +158,9 @@ def start_system():
         safe_lcd_write(f"BLOW NOW {remaining}s", f"D0 State: {'ALARM!' if mq3_d0_state == MQ3_D0_ALARM_THRESHOLD else 'Clear'}")
         time.sleep(0.1)
 
-    # PASS CONDITION: No alcohol detected for the duration (Relay turns ON/HIGH)
+    # PASS CONDITION: No alcohol detected for the duration (Relay turns UNLOCKED/LOW)
     print("\n\n✅ TEST PASSED. ENGINE UNLOCKED.")
-    GPIO.output(RELAY_PIN, RELAY_UNLOCKED_STATE) # Unlock Relay (Relay ON)
+    GPIO.output(RELAY_PIN, RELAY_UNLOCKED_STATE) # Unlock Relay (Relay LOW)
     GPIO.output(LED_PIN, GPIO.LOW)   # LED OFF
     safe_lcd_write("TEST PASSED", "DRIVE SAFELY")
 
@@ -178,7 +178,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n[CRITICAL ERROR] Unhandled exception: {e}")
     finally:
-        # CRITICAL SAFETY STEP: Always ensure the vehicle is LOCKED (Relay OFF) on exit
-        print("\n[System] Ensuring vehicle is LOCKED (Relay OFF) and cleaning up GPIO.")
+        # CRITICAL SAFETY STEP: Always ensure the vehicle is LOCKED (Relay HIGH) on exit
+        print("\n[System] Ensuring vehicle is LOCKED (Relay HIGH) and cleaning up GPIO.")
         GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE) # FORCE LOCK
         GPIO.cleanup()
