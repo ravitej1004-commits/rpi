@@ -1,0 +1,196 @@
+import time
+import serial
+import pynmea2
+import RPi.GPIO as GPIO
+from RPLCD.i2c import CharLCD
+
+# --- CONFIGURATION ---
+TEST_WINDOW = 5.0 # Duration of test in seconds
+PHONE_NUMBER_TO_ALERT = "+91xxxxxxxxxx" # UPDATE THIS PHONE NUMBER
+
+# --- PINS & PORTS ---
+GSM_SERIAL_PORT = "/dev/serial0"
+GPS_SERIAL_PORT = "/dev/ttyAMA3" 
+GPS_BAUDRATE = 9600
+
+RELAY_PIN = 23    # Output to Relay
+LED_PIN = 24      # Output to Status LED
+MQ3_D0_PIN = 18   # Input from MQ-3 Digital Output (D0)
+
+# Define Logic States
+RELAY_LOCKED = GPIO.HIGH 
+RELAY_UNLOCKED = GPIO.LOW 
+MQ3_TRIGGERED_STATE = GPIO.LOW # Assuming Active LOW trigger
+
+# --- SETUP ---
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Outputs
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.setup(LED_PIN, GPIO.OUT)
+GPIO.output(RELAY_PIN, RELAY_LOCKED) 
+GPIO.output(LED_PIN, GPIO.LOW)
+
+# Input (MQ-3 D0 pin) with pull-up for stability
+GPIO.setup(MQ3_D0_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) 
+
+# --- INITIALIZATION ---
+lcd = None
+ser_gsm = None
+ser_gps = None
+
+try:
+    lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, backlight_enabled=True)
+    lcd.clear()
+    lcd.write_string("Digital Interlock")
+    time.sleep(1)
+except Exception as e:
+    print(f"WARNING: LCD Failed: {e}. Running without display.")
+    lcd = None
+    
+try:
+    ser_gsm = serial.Serial(GSM_SERIAL_PORT, 9600, timeout=1)
+    ser_gps = serial.Serial(GPS_SERIAL_PORT, GPS_BAUDRATE, timeout=0.1)
+    print("Serial Ports Initialized.")
+except Exception as e:
+    print(f"FATAL: Serial Port Failed: {e}")
+    GPIO.cleanup()
+    exit()
+
+# --- GPS/SMS HELPERS ---
+
+def get_gps_location(gps_ser):
+    # Reads current GPS data
+    try:
+        data = gps_ser.read(512).decode('ascii', errors='ignore')
+        for line in data.splitlines():
+            if "$GPGGA" in line and '1,' in line: # Checks for valid fix (Quality 1 or 2)
+                msg = pynmea2.parse(line)
+                if msg.latitude and msg.longitude:
+                    return f"{msg.latitude:.5f},{msg.longitude:.5f}"
+    except:
+        pass
+    return "No Fix"
+
+def send_sms_alert(ser, phone_number, location):
+    if lcd:
+        lcd.clear()
+        lcd.write_string("Sending SMS...")
+    print(">>> ALARM! Sending SMS...")
+    try:
+        ser.write(b'AT+CMGF=1\r\n')
+        time.sleep(0.5)
+        ser.write(f'AT+CMGS="{phone_number}"\r\n'.encode())
+        time.sleep(0.5)
+        
+        msg = f"IGNITION LOCKOUT! Alcohol Detected. Location: http://maps.google.com/?q={location}"
+        ser.write(msg.encode())
+        ser.write(bytes([26])) # Ctrl+Z to send
+        time.sleep(3)
+        if lcd:
+            lcd.clear()
+            lcd.write_string("SMS Sent OK")
+        print("SMS Sent.")
+    except Exception as e:
+        if lcd:
+            lcd.clear()
+            lcd.write_string("SMS Failed")
+        print(f"SMS Error: {e}")
+
+# --- MAIN PROGRAM LOOP ---
+
+try:
+    while True:
+        
+        print("\n--- NEW TEST STARTING ---")
+        if lcd:
+            lcd.clear()
+            lcd.write_string("BLOW NOW! (5s)")
+        
+        start_time = time.time()
+        test_failed = False
+        
+        while time.time() - start_time < TEST_WINDOW:
+            time_left = TEST_WINDOW - (time.time() - start_time)
+            
+            # Read Sensor and GPS
+            mq3_state = GPIO.input(MQ3_D0_PIN)
+            gps_data = get_gps_location(ser_gps)
+
+            # --- FAIL CONDITION CHECK ---
+            if mq3_state == MQ3_TRIGGERED_STATE:
+                test_failed = True
+                break # Exit the test window immediately on fail
+
+            # Update Display and Console
+            status_text = "CLEAR" if mq3_state != MQ3_TRIGGERED_STATE else "ALARM!"
+            print(f"Time: {time_left:.1f}s | Status: {status_text} | GPS: {gps_data}", end="\r")
+
+            if lcd:
+                lcd.cursor_pos = (0, 0)
+                lcd.write_string(f"GPS: {gps_data[:10]} ")
+                lcd.cursor_pos = (1, 0)
+                lcd.write_string(f"Time: {time_left: <4.1f}s {status_text}")
+            
+            time.sleep(0.1)
+
+        # --- PROCESS RESULT ---
+        
+        if test_failed:
+            # --- FAIL ---
+            current_location = gps_data if gps_data != "No Fix" else "Unknown"
+            
+            print("\n❌ TEST FAILED. System Locked.")
+            GPIO.output(RELAY_PIN, RELAY_LOCKED) 
+            GPIO.output(LED_PIN, GPIO.HIGH) # LED ON
+            if lcd:
+                lcd.clear()
+                lcd.write_string("TEST FAILED!")
+            
+            send_sms_alert(ser_gsm, PHONE_NUMBER_TO_ALERT, current_location)
+            
+            # Lock loop (requires user intervention/reboot to restart)
+            if lcd: lcd.write_string("\nSYSTEM LOCKED")
+            print("System Locked until intervention.")
+            while True:
+                get_gps_location(ser_gps) # Keep updating GPS for future alerts
+                time.sleep(5)
+                
+        else:
+            # --- PASS ---
+            print("\n✅ TEST PASSED. Vehicle Unlocked.")
+            GPIO.output(RELAY_PIN, RELAY_UNLOCKED) # Relay ON (Unlocked)
+            GPIO.output(LED_PIN, GPIO.LOW) # LED OFF
+            if lcd:
+                lcd.clear()
+                lcd.write_string("TEST PASSED")
+                lcd.crlf()
+                lcd.write_string("VEHICLE UNLOCKED")
+
+            # Hold unlock state and loop back to reset
+            print("Holding UNLOCKED state for 10 seconds before next test.")
+            if lcd:
+                lcd.cursor_pos = (1, 0)
+                lcd.write_string("Reset in 10s...")
+            time.sleep(10.0)
+
+except KeyboardInterrupt:
+    print("\nProgram stopped by user.")
+except Exception as e:
+    print(f"\nFATAL ERROR: {e}")
+finally:
+    print("\nCleaning up hardware...")
+    if lcd:
+        lcd.clear()
+        lcd.write_string("System OFF")
+        lcd.backlight_enabled = False
+    
+    GPIO.output(RELAY_PIN, RELAY_LOCKED)
+    GPIO.output(LED_PIN, GPIO.LOW)
+    GPIO.cleanup()
+    
+    if ser_gsm and ser_gsm.is_open:
+        ser_gsm.close()
+    if ser_gps and ser_gps.is_open:
+        ser_gps.close()
