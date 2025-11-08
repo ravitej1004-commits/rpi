@@ -1,174 +1,98 @@
 import time
-import serial
-import pynmea2
-import RPi.GPIO as GPIO
+import math
+import board
+import busio
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
 from RPLCD.i2c import CharLCD
+import RPi.GPIO as GPIO
 
-# --- CONFIGURATION ---
-TARGET_PHONE_NUMBER = "+919876543210"  # Recipient for SMS alerts
-MQ3_D0_ALARM_THRESHOLD = GPIO.LOW      # MQ3 triggers LOW on alcohol detection
-TEST_WINDOW = 5                        # Duration of test in seconds
+# -----------------------------
+# GPIO Configuration
+# -----------------------------
+RELAY_PIN = 23         # BCM pin connected to relay
+RELAY_ACTIVE_LOW = True # True if relay is active on LOW signal
 
-# --- PINS ---
-RELAY_PIN = 23                         # Vehicle relay control
-LED_PIN = 24                           # Visual fail indicator
-MQ3_D0_PIN = 18                        # MQ3 digital output
-GPS_PORT = "/dev/ttyAMA3"              # GPS UART
-GSM_PORT = "/dev/serial0"              # GSM UART
-
-# --- RELAY LOGIC (Active-Low) ---
-RELAY_LOCKED_STATE = GPIO.HIGH         # Relay OFF = Locked
-RELAY_UNLOCKED_STATE = GPIO.LOW        # Relay ON  = Unlocked
-
-# --- GPIO SETUP ---
 GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
 GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.setup(LED_PIN, GPIO.OUT)
-GPIO.setup(MQ3_D0_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-# Start with vehicle LOCKED
-GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE)
-GPIO.output(LED_PIN, GPIO.LOW)
+if RELAY_ACTIVE_LOW:
+    RELAY_ON = GPIO.LOW
+    RELAY_OFF = GPIO.HIGH
+else:
+    RELAY_ON = GPIO.HIGH
+    RELAY_OFF = GPIO.LOW
 
-# --- LCD SETUP ---
+GPIO.output(RELAY_PIN, RELAY_OFF)  # Keep relay OFF initially
+
+# -----------------------------
+# LCD Initialization
+# -----------------------------
+lcd = CharLCD('PCF8574', 0x27)
+lcd.clear()
+lcd.write_string("MQ3 Alcohol Test")
+time.sleep(2)
+lcd.clear()
+
+# -----------------------------
+# ADS1115 & MQ3 Setup
+# -----------------------------
+i2c = busio.I2C(board.SCL, board.SDA)
+ads = ADS.ADS1115(i2c)
+chan = AnalogIn(ads, ADS.P0)
+
+# Calibration baseline (Ro)
+print("--- MQ3 Alcohol Detection ---")
+lcd.write_string("Calibrating MQ3...")
+Ro = 21680.9  # You can adjust this from your earlier calibration
+time.sleep(2)
+lcd.clear()
+
+ALCOHOL_THRESHOLD = 150  # PPM threshold for relay trigger
+
+def read_mq3():
+    voltage = chan.voltage
+    Rs = (5.0 - voltage) * 10000 / voltage  # assuming 10k load resistor
+    ratio = Rs / Ro
+    # Approximation formula for PPM (adjust for your sensor)
+    ppm = math.pow(10, (0.3934 * math.log10(ratio) + 1.5))
+    return voltage, ratio, ppm
+
+# -----------------------------
+# Main Loop
+# -----------------------------
+print("System Ready. Monitoring alcohol levels...")
+lcd.write_string("Monitoring...")
+
 try:
-    lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2)
-    lcd.clear()
-except:
-    lcd = None
+    while True:
+        voltage, ratio, ppm = read_mq3()
+        print(f"Voltage: {voltage:.3f} V | Rs/Ro: {ratio:.3f} | Alcohol: {ppm:.2f} PPM")
 
-# --- SERIAL PORTS ---
-try:
-    gps_serial = serial.Serial(GPS_PORT, baudrate=9600, timeout=0.1)
-except:
-    gps_serial = None
+        lcd.home()
+        lcd.write_string(f"Alcohol:{ppm:>6.1f}PPM")
+        lcd.crlf()
 
-try:
-    gsm_serial = serial.Serial(GSM_PORT, baudrate=9600, timeout=1)
-except:
-    gsm_serial = None
-
-# --- GLOBAL GPS DATA ---
-current_lat = "No GPS Fix"
-current_lon = ""
-
-
-# --- HELPER FUNCTIONS ---
-def safe_lcd_write(line1, line2=""):
-    if lcd:
-        try:
-            lcd.clear()
-            lcd.write_string(line1.ljust(16))
-            lcd.cursor_pos = (1, 0)
-            lcd.write_string(line2.ljust(16))
-        except:
-            pass
-
-
-def update_gps():
-    global current_lat, current_lon
-    if not gps_serial or not gps_serial.is_open:
-        return
-    while gps_serial.in_waiting > 0:
-        try:
-            line = gps_serial.readline().decode('utf-8', errors='replace').strip()
-            if line.startswith('$GPGGA'):
-                msg = pynmea2.parse(line)
-                if msg.gps_qual > 0:
-                    current_lat = str(round(msg.latitude, 5))
-                    current_lon = str(round(msg.longitude, 5))
-        except:
-            pass
-
-
-def send_sms_alert():
-    if not gsm_serial or not gsm_serial.is_open:
-        safe_lcd_write("SMS FAILED", "GSM Error")
-        return
-
-    safe_lcd_write("ALARM!", "Sending SMS...")
-    try:
-        gsm_serial.write(b'AT+CMGF=1\r\n')
-        time.sleep(0.5)
-        gsm_serial.read_all()
-        gsm_serial.write(f'AT+CMGS="{TARGET_PHONE_NUMBER}"\r\n'.encode('utf-8'))
-        time.sleep(0.5)
-
-        if current_lat == "No GPS Fix":
-            loc_msg = "Location: No GPS Fix"
+        if ppm > ALCOHOL_THRESHOLD:
+            lcd.write_string("Status: OVER LIMIT")
+            GPIO.output(RELAY_PIN, RELAY_ON)
         else:
-            loc_msg = f"Location: https://maps.google.com/?q={current_lat},{current_lon}"
+            lcd.write_string("Status: SAFE      ")
+            GPIO.output(RELAY_PIN, RELAY_OFF)
 
-        msg = f"ALCOHOL DETECTED! VEHICLE LOCKED.\n{loc_msg}"
-        gsm_serial.write(msg.encode('utf-8'))
-        time.sleep(0.5)
-        gsm_serial.write(bytes([26]))
-        time.sleep(5.0)
-        gsm_serial.read_all()
-    except:
-        pass
+        time.sleep(1)
 
+except KeyboardInterrupt:
+    print("\n[System] Test stopped manually.")
 
-# --- MAIN FUNCTION ---
-def start_system():
-    print("\n--- VEHICLE INTERLOCK SYSTEM ---")
-    safe_lcd_write("INTERLOCK ACTIVE", "Blow Now (5s)")
-
-    start_time = time.time()
-    while (time.time() - start_time) < TEST_WINDOW:
-        remaining = int(TEST_WINDOW - (time.time() - start_time)) + 1
-        mq3_d0_state = GPIO.input(MQ3_D0_PIN)
-        update_gps()
-
-        print(f"Time: {remaining}s | D0: {'ALARM' if mq3_d0_state == MQ3_D0_ALARM_THRESHOLD else 'Clear'} | GPS: {current_lat}", end="\r")
-
-        if mq3_d0_state == MQ3_D0_ALARM_THRESHOLD:
-            print("\n❌ TEST FAILED! Alcohol detected.")
-            GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE)
-            GPIO.output(LED_PIN, GPIO.HIGH)
-            safe_lcd_write("TEST FAILED!", "SYSTEM LOCKED")
-            send_sms_alert()
-
-            # Stay locked until manual reset
-            while True:
-                update_gps()
-                time.sleep(1)
-
-        safe_lcd_write(f"BLOW NOW {remaining}s", f"State: {'ALARM' if mq3_d0_state == MQ3_D0_ALARM_THRESHOLD else 'Clear'}")
-        time.sleep(0.1)
-
-    # ✅ PASS CONDITION
-    print("\n✅ TEST PASSED. Engine unlocked.")
-    GPIO.output(RELAY_PIN, RELAY_UNLOCKED_STATE)
-    GPIO.output(LED_PIN, GPIO.LOW)
-    safe_lcd_write("TEST PASSED", "Drive Safe")
-
-    # --- NEW ADDITION ---
-    # Release relay GPIO to fully turn it OFF when test completes
-    print("[System] Releasing relay pin to fully disable relay.")
+finally:
+    # Turn off relay safely
+    print("[System] Turning relay OFF and releasing GPIO.")
+    GPIO.output(RELAY_PIN, RELAY_OFF)
+    time.sleep(1)
     GPIO.cleanup(RELAY_PIN)
-    safe_lcd_write("RELAY RELEASED", "System Idle")
-
-
-# --- MAIN LOOP ---
-if __name__ == "__main__":
-    try:
-        start_system()
-        while True:
-            update_gps()
-            time.sleep(1)
-
-    except KeyboardInterrupt:
-        print("\n[System] User stopped program.")
-
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-
-    finally:
-        print("\n[System] Cleaning up all GPIOs and locking vehicle.")
-        try:
-            GPIO.output(RELAY_PIN, RELAY_LOCKED_STATE)
-        except:
-            pass
-        GPIO.cleanup()
+    lcd.clear()
+    lcd.write_string("System Released")
+    time.sleep(2)
+    lcd.clear()
+    print("[System] GPIO released successfully. Relay OFF.")
