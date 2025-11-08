@@ -1,116 +1,33 @@
-import time
-import serial
-import pynmea2
 import RPi.GPIO as GPIO
-import board
-import busio
-from adafruit_ads1x15.ads1115 import ADS1115
-from adafruit_ads1x15.analog_in import AnalogIn
-from RPLCD.i2c import CharLCD
+import time
 
-# --- CONFIGURATION ---
-ALCOHOL_THRESHOLD = 23500
-TEST_WINDOW = 5
-P0 = 0 # ADC Channel A0
+MQ3_D0_PIN = 18 # Using GPIO 18 (Physical Pin 12) for the digital signal
 
-# --- PINS ---
-RELAY_PIN = 23
-LED_PIN = 24
-GPS_PORT = "/dev/ttyAMA3"
-GSM_PORT = "/dev/serial0"
-
-# --- SETUP ---
+# --- Setup ---
 GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
-GPIO.setup(RELAY_PIN, GPIO.OUT)
-GPIO.setup(LED_PIN, GPIO.OUT)
-GPIO.output(RELAY_PIN, GPIO.HIGH)
-GPIO.output(LED_PIN, GPIO.LOW)
-
-# Initialize Hardware (use try/except for robustness)
-try:
-    i2c = busio.I2C(board.SCL, board.SDA)
-    lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8)
-    ads = ADS1115(i2c)
-    mq3 = AnalogIn(ads, P0)
-    print("Hardware: LCD and ADC Initialized.")
-except Exception as e:
-    print(f"Hardware Initialization Failed: {e}")
-    exit()
+# Set pin as input and enable pull-up resistor for stability
+GPIO.setup(MQ3_D0_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP) 
 
 try:
-    gps_serial = serial.Serial(GPS_PORT, baudrate=9600, timeout=0.1)
-    gsm_serial = serial.Serial(GSM_PORT, baudrate=9600, timeout=1)
-    print("Serial Ports: GPS/GSM Opened.")
-except Exception as e:
-    print(f"Serial Port Error: {e}")
-    exit()
-
-
-# --- THONNY VISIBLE LOOP ---
-
-print("\n\n--- STARTING FULL PROCESS (Visible in Thonny) ---")
-lcd.clear()
-lcd.write_string("BLOW NOW! (5s)")
-
-start_time = time.time()
-while (time.time() - start_time) < TEST_WINDOW:
-    # Calculate time remaining
-    remaining = int(TEST_WINDOW - (time.time() - start_time)) + 1
+    print("--- MQ-3 Digital (D0) Monitor ---")
+    print("Adjust the potentiometer on the MQ-3 board to set the trigger point.")
+    print("Press CTRL+C to stop.\n")
     
-    print("--------------------------------")
-    print(f"CYCLE START: Time Remaining: {remaining}s")
-
-    # 1. Check GPS Data
-    print("1. Checking GPS data...")
-    if gps_serial.in_waiting > 0:
-         try:
-             line = gps_serial.readline().decode('utf-8', errors='replace')
-             print(f"   -> GPS received: {line.strip()[:10]}...")
-         except:
-             print("   -> GPS read error.")
-    else:
-        print("   -> No new GPS data.")
-
-    # 2. Read MQ-3 Sensor
-    print("2. Reading MQ-3 Sensor...")
-    try:
-        val = mq3.value
-        print(f"   -> Sensor Value: {val}")
-    except Exception as e:
-        print(f"   -> SENSOR READ FAILED: {e}")
-        val = 0
-
-    # 3. Check Condition
-    if val > ALCOHOL_THRESHOLD:
-        print("\n!!! ALCOHOL THRESHOLD EXCEEDED !!!")
-        print("!!! SYSTEM FAIL !!!")
-        GPIO.output(RELAY_PIN, GPIO.HIGH)
-        GPIO.output(LED_PIN, GPIO.HIGH)
-        lcd.clear()
-        lcd.write_string("TEST FAILED!")
+    while True:
+        # Read the state of the D0 pin
+        d0_state = GPIO.input(MQ3_D0_PIN)
         
-        # NOTE: SMS alert function call would go here
-        
-        print("--- SYSTEM LOCKED ---")
-        while True: time.sleep(1) # Lock
+        # NOTE: Digital outputs can be active HIGH or active LOW.
+        # This checks for a typical Active LOW trigger (where LOW means alarm ON)
+        if d0_state == GPIO.LOW:
+            status = "!!! ALARM TRIGGERED !!!"
+        else:
+            status = "Safe (Below D0 Threshold)"
+            
+        print(f"D0 State: {'LOW' if d0_state == GPIO.LOW else 'HIGH'} | {status}")
+        time.sleep(0.5)
 
-    # 4. Update LCD
-    print("4. Updating LCD...")
-    try:
-        lcd.cursor_pos = (1,0)
-        lcd.write_string(f"Time: {remaining}s Val:{val}".ljust(16))
-        print("   -> LCD Update Successful.")
-    except Exception as e:
-         print(f"   -> LCD FAILED to update: {e}")
-
-    time.sleep(0.5)
-
-print("\n\n--- TEST WINDOW COMPLETE ---")
-print("RESULT: PASSED. Unlocking Relay.")
-GPIO.output(RELAY_PIN, GPIO.LOW) # Unlock Relay
-GPIO.output(LED_PIN, GPIO.LOW)
-lcd.clear()
-lcd.write_string("PASSED - DRIVE")
-
-while True: time.sleep(1)
+except KeyboardInterrupt:
+    print("\nDigital monitoring stopped.")
+finally:
+    GPIO.cleanup()
